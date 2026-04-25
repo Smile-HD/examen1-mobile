@@ -216,7 +216,13 @@ class _IncidentReportScreenState extends State<IncidentReportScreen> {
       final Position position = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 15),
         ),
+      ).timeout(
+        const Duration(seconds: 20),
+        onTimeout: () {
+          throw Exception('Tiempo de espera agotado. Verifica que el GPS esté activado y tengas buena señal.');
+        },
       );
 
       String direccionText = 'Dirección desconocida';
@@ -224,6 +230,12 @@ class _IncidentReportScreenState extends State<IncidentReportScreen> {
         List<Placemark> placemarks = await placemarkFromCoordinates(
           position.latitude,
           position.longitude,
+        ).timeout(
+          const Duration(seconds: 10),
+          onTimeout: () {
+            // Si falla la geocodificación, retornamos lista vacía
+            return <Placemark>[];
+          },
         );
         if (placemarks.isNotEmpty) {
           final place = placemarks.first;
@@ -231,6 +243,7 @@ class _IncidentReportScreenState extends State<IncidentReportScreen> {
         }
       } catch (e) {
         // Si la libreria geocoding falla, mantendremos direccion desconocida y no detenemos la ejecucion.
+        debugPrint('Error en geocodificación: $e');
       }
 
       if (mounted) {

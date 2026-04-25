@@ -207,15 +207,13 @@ class PushNotificationsService {
         if (token != null && token.trim().isNotEmpty) {
           return token;
         }
-        debugPrint('Push getToken intento=$attempt sin token.');
       } catch (e) {
         lastError = e;
         final normalized = e.toString().toUpperCase();
         final isServiceUnavailable =
             normalized.contains('SERVICE_NOT_AVAILABLE') ||
-            normalized.contains('UNAVAILABLE');
-
-        debugPrint('Push getToken intento=$attempt error=$e');
+            normalized.contains('UNAVAILABLE') ||
+            normalized.contains('SERVICE NOT AVAILABLE');
 
         if (!isServiceUnavailable) {
           rethrow;
@@ -223,7 +221,7 @@ class PushNotificationsService {
       }
 
       if (attempt < 6) {
-        await Future<void>.delayed(Duration(milliseconds: 700 * attempt));
+        await Future<void>.delayed(Duration(seconds: attempt));
       }
     }
 

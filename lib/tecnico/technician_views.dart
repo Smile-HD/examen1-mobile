@@ -82,7 +82,15 @@ class _TechnicianIncomingRequestsViewState extends State<TechnicianIncomingReque
     try {
       await _ensureLocationPermission();
       final current = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 15),
+        ),
+      ).timeout(
+        const Duration(seconds: 20),
+        onTimeout: () {
+          throw Exception('Tiempo de espera agotado obteniendo ubicación.');
+        },
       );
 
       final mapsUri = Uri.parse(
@@ -211,7 +219,15 @@ class _TechnicianIncomingRequestsViewState extends State<TechnicianIncomingReque
     try {
       await _ensureLocationPermission();
       final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 15),
+        ),
+      ).timeout(
+        const Duration(seconds: 20),
+        onTimeout: () {
+          throw Exception('Tiempo de espera agotado obteniendo ubicación.');
+        },
       );
 
       final baseUrl = dotenv.env['API_URL'] ?? 'http://10.0.2.2:8000/api/v1';

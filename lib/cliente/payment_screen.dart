@@ -5,15 +5,18 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:path_provider/path_provider.dart';
 
 class PaymentScreen extends StatefulWidget {
   final int incidenteId;
   final String token;
+  final double? suggestedAmount; // Monto sugerido desde las métricas
 
   const PaymentScreen({
     super.key,
     required this.incidenteId,
     required this.token,
+    this.suggestedAmount,
   });
 
   @override
@@ -32,6 +35,12 @@ class _PaymentScreenState extends State<PaymentScreen> {
   @override
   void initState() {
     super.initState();
+    // Pre-llenar el monto si viene sugerido desde las métricas
+    if (widget.suggestedAmount != null && widget.suggestedAmount! > 0) {
+      _amountController.text = widget.suggestedAmount!.toStringAsFixed(2);
+    }
+    // Cargar el pago existente si ya hay uno
+    _loadExistingPayment();
   }
 
   @override
@@ -42,7 +51,8 @@ class _PaymentScreenState extends State<PaymentScreen> {
 
   String _paymentsBaseUrl() {
     final baseUrl = dotenv.env['API_URL'] ?? 'http://10.0.2.2:8000/api/v1';
-    return baseUrl.replaceFirst(RegExp(r'/api/v1/?$'), '');
+    // Mantener /api/v1 en la URL base para las rutas de pagos
+    return baseUrl;
   }
 
   String _parseBackendError(String body) {
@@ -78,6 +88,47 @@ class _PaymentScreenState extends State<PaymentScreen> {
       return '${origin.scheme}://${origin.host}${origin.hasPort ? ':${origin.port}' : ''}/$trimmed';
     } catch (_) {
       return trimmed;
+    }
+  }
+
+  Future<void> _loadExistingPayment() async {
+    try {
+      final url = Uri.parse('${_paymentsBaseUrl()}/payments/client');
+
+      final response = await http
+          .get(
+            url,
+            headers: {
+              'Authorization': 'Bearer ${widget.token}',
+            },
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data is Map<String, dynamic> && data['payments'] is List) {
+          final payments = data['payments'] as List;
+          // Buscar el pago de este incidente
+          for (final payment in payments) {
+            if (payment is Map<String, dynamic> &&
+                payment['incident_id'] == widget.incidenteId) {
+              if (mounted) {
+                setState(() {
+                  _paymentData = payment;
+                  // Si el pago está rechazado, permitir crear uno nuevo o reenviar comprobante
+                  if (payment['status'] == 'rechazado') {
+                    _errorMessage = 
+                        'El pago anterior fue rechazado. Puedes reenviar el comprobante o crear un nuevo pago.';
+                  }
+                });
+              }
+              break;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Error cargando pago existente: $e');
     }
   }
 
@@ -119,15 +170,24 @@ class _PaymentScreenState extends State<PaymentScreen> {
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         if (mounted) {
+          final responseData = json.decode(response.body);
+          debugPrint('=== DEBUG CREATE PAYMENT RESPONSE ===');
+          debugPrint('Response: $responseData');
+          debugPrint('=====================================');
           setState(() {
-            _paymentData = json.decode(response.body);
+            _paymentData = responseData;
             _errorMessage = null;
           });
         }
       } else {
         if (mounted) {
+          final errorMsg = _parseBackendError(response.body);
           setState(() {
-            _errorMessage = _parseBackendError(response.body);
+            _errorMessage = errorMsg;
+            // Si el error indica que ya existe un pago rechazado, mostrar opción de reenvío
+            if (errorMsg.contains('rechazado')) {
+              _loadExistingPayment();
+            }
           });
         }
       }
@@ -237,12 +297,106 @@ class _PaymentScreenState extends State<PaymentScreen> {
     }
   }
 
+  Future<void> _downloadQrImage(String imageUrl) async {
+    try {
+      // Mostrar indicador de carga
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                ),
+                SizedBox(width: 16),
+                Text('Descargando QR...'),
+              ],
+            ),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+
+      // Descargar la imagen
+      final response = await http.get(Uri.parse(imageUrl));
+      
+      if (response.statusCode != 200) {
+        throw Exception('Error al descargar la imagen');
+      }
+
+      // Obtener directorio de descargas
+      Directory? directory;
+      if (Platform.isAndroid) {
+        // En Android, usar el directorio de descargas público
+        directory = Directory('/storage/emulated/0/Download');
+        if (!await directory.exists()) {
+          directory = await getExternalStorageDirectory();
+        }
+      } else {
+        // En iOS, usar el directorio de documentos de la app
+        directory = await getApplicationDocumentsDirectory();
+      }
+
+      if (directory == null) {
+        throw Exception('No se pudo acceder al almacenamiento');
+      }
+
+      // Crear nombre de archivo único
+      final fileName = 'qr_pago_${_paymentData!['payment_id']}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final filePath = '${directory.path}/$fileName';
+
+      // Guardar archivo
+      final file = File(filePath);
+      await file.writeAsBytes(response.bodyBytes);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('QR guardado en: ${Platform.isAndroid ? 'Descargas' : 'Documentos'}'),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 3),
+            action: SnackBarAction(
+              label: 'OK',
+              textColor: Colors.white,
+              onPressed: () {},
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error descargando QR: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al descargar: ${e.toString()}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final qrAbsoluteUrl = _absoluteUrl(
       (_paymentData?['qr_image_url_absolute'] ?? _paymentData?['qr_image_url'])
           ?.toString(),
     );
+
+    // DEBUG: Imprimir información del QR
+    if (_paymentData != null) {
+      debugPrint('=== DEBUG QR ===');
+      debugPrint('qr_image_url: ${_paymentData?['qr_image_url']}');
+      debugPrint('qr_image_url_absolute: ${_paymentData?['qr_image_url_absolute']}');
+      debugPrint('qrAbsoluteUrl construido: $qrAbsoluteUrl');
+      debugPrint('================');
+    }
 
     return Scaffold(
       appBar: AppBar(
@@ -303,6 +457,43 @@ class _PaymentScreenState extends State<PaymentScreen> {
                 ),
               ],
             ] else ...[
+              // Mostrar estado del pago existente
+              if (_paymentData!['status'] == 'rechazado') ...[
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.red.shade200),
+                  ),
+                  child: const Column(
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.cancel, color: Colors.red),
+                          SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              'Pago Rechazado',
+                              style: TextStyle(
+                                color: Colors.red,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 8),
+                      Text(
+                        'El taller rechazó tu comprobante. Por favor, sube un nuevo comprobante de pago.',
+                        style: TextStyle(color: Colors.black87),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+              ],
               if (_uploadSuccessMessage != null) ...[
                 Container(
                   padding: const EdgeInsets.all(16),
@@ -377,23 +568,64 @@ class _PaymentScreenState extends State<PaymentScreen> {
                           style: TextStyle(color: Colors.black54),
                         ),
                         const SizedBox(height: 16),
-                        if (qrAbsoluteUrl.isNotEmpty)
-                          Image.network(
-                            qrAbsoluteUrl,
-                            height: 250,
-                            fit: BoxFit.contain,
-                            errorBuilder: (context, error, stackTrace) =>
-                                const Icon(
-                                  Icons.qr_code_scanner,
-                                  size: 100,
-                                  color: Colors.grey,
-                                ),
-                          )
-                        else
-                          const Icon(
-                            Icons.qr_code_scanner,
-                            size: 100,
-                            color: Colors.grey,
+                        if (qrAbsoluteUrl.isNotEmpty) ...[
+                          Container(
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.grey.shade300),
+                            ),
+                            child: Image.network(
+                              qrAbsoluteUrl,
+                              height: 300,
+                              width: 300,
+                              fit: BoxFit.contain,
+                              errorBuilder: (context, error, stackTrace) =>
+                                  const Column(
+                                    children: [
+                                      Icon(
+                                        Icons.qr_code_scanner,
+                                        size: 100,
+                                        color: Colors.grey,
+                                      ),
+                                      SizedBox(height: 8),
+                                      Text(
+                                        'Error al cargar QR',
+                                        style: TextStyle(color: Colors.grey),
+                                      ),
+                                    ],
+                                  ),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          ElevatedButton.icon(
+                            onPressed: () => _downloadQrImage(qrAbsoluteUrl),
+                            icon: const Icon(Icons.download),
+                            label: const Text('Descargar QR'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.green,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 24,
+                                vertical: 12,
+                              ),
+                            ),
+                          ),
+                        ] else
+                          const Column(
+                            children: [
+                              Icon(
+                                Icons.qr_code_scanner,
+                                size: 100,
+                                color: Colors.grey,
+                              ),
+                              SizedBox(height: 8),
+                              Text(
+                                'QR no disponible',
+                                style: TextStyle(color: Colors.grey),
+                              ),
+                            ],
                           ),
                       ],
                     ),

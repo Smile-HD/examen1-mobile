@@ -270,6 +270,8 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
   Timer? _pollTimer;
   List<Map<String, dynamic>> _allRequests = <Map<String, dynamic>>[];
   List<Map<String, dynamic>> _pendingRequests = <Map<String, dynamic>>[];
+  List<Map<String, dynamic>> _pendingPaymentRequests = <Map<String, dynamic>>[];
+  Map<int, Map<String, dynamic>> _paymentsByIncident = {};
 
   @override
   void initState() {
@@ -411,11 +413,14 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
     );
   }
 
-  void _openPaymentScreen(int incidenteId) async {
+  void _openPaymentScreen(int incidenteId, {double? suggestedAmount}) async {
     final result = await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) =>
-            PaymentScreen(incidenteId: incidenteId, token: widget.token),
+        builder: (_) => PaymentScreen(
+          incidenteId: incidenteId,
+          token: widget.token,
+          suggestedAmount: suggestedAmount,
+        ),
       ),
     );
 
@@ -441,6 +446,42 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
 
   List<Map<String, dynamic>> get _visibleRequests {
     return _showFullHistory ? _allRequests : _pendingRequests;
+  }
+
+  Future<void> _loadPayments() async {
+    try {
+      final baseUrl = dotenv.env['API_URL'] ?? 'http://10.0.2.2:8000/api/v1';
+      final url = Uri.parse('$baseUrl/payments/client');
+
+      final response = await http
+          .get(url, headers: {'Authorization': 'Bearer ${widget.token}'})
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data is Map<String, dynamic> && data['payments'] is List) {
+          final payments = data['payments'] as List;
+          final Map<int, Map<String, dynamic>> paymentMap = {};
+          
+          for (final payment in payments) {
+            if (payment is Map<String, dynamic>) {
+              final incidentId = payment['incident_id'] as int?;
+              if (incidentId != null) {
+                paymentMap[incidentId] = payment;
+              }
+            }
+          }
+          
+          if (mounted) {
+            setState(() {
+              _paymentsByIncident = paymentMap;
+            });
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Error cargando pagos: $e');
+    }
   }
 
   Future<void> _loadClientRequests({bool refresh = false}) async {
@@ -473,7 +514,49 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
           }
         }
 
+        // Cargar pagos para verificar estados
+        await _loadPayments();
+
+        // Filtrar incidentes que necesitan pago o tienen pago rechazado
+        final pendingPayment = rawItems.where((item) {
+          final estadoIncidente = (item['estado_incidente'] ?? '').toString().trim().toLowerCase();
+          final incidentId = item['incidente_id'] as int?;
+          
+          // Si el incidente está atendido, necesita pago
+          if (estadoIncidente == 'atendido') {
+            // Verificar si ya tiene un pago
+            if (incidentId != null && _paymentsByIncident.containsKey(incidentId)) {
+              final payment = _paymentsByIncident[incidentId]!;
+              final paymentStatus = (payment['status'] ?? '').toString().trim().toLowerCase();
+              // Mostrar si el pago está pendiente, en verificación o rechazado
+              return paymentStatus == 'pendiente' || 
+                     paymentStatus == 'verificacion' || 
+                     paymentStatus == 'rechazado';
+            }
+            // Si no tiene pago, necesita crear uno
+            return true;
+          }
+          
+          // Si tiene un pago rechazado, mostrarlo
+          if (incidentId != null && _paymentsByIncident.containsKey(incidentId)) {
+            final payment = _paymentsByIncident[incidentId]!;
+            final paymentStatus = (payment['status'] ?? '').toString().trim().toLowerCase();
+            return paymentStatus == 'rechazado';
+          }
+          
+          return false;
+        }).toList();
+
+        // Filtrar solicitudes pendientes (excluyendo las que están en pendingPayment)
+        final pendingPaymentIds = pendingPayment.map((item) => item['incidente_id'] as int?).toSet();
         final pending = rawItems.where((item) {
+          final incidentId = item['incidente_id'] as int?;
+          
+          // Excluir si está en pagos pendientes
+          if (incidentId != null && pendingPaymentIds.contains(incidentId)) {
+            return false;
+          }
+          
           final hasMetric = item['metrica'] is Map;
           if (hasMetric) {
             return false;
@@ -486,6 +569,7 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
           setState(() {
             _allRequests = rawItems;
             _pendingRequests = pending;
+            _pendingPaymentRequests = pendingPayment;
             _errorMessage = null;
           });
         }
@@ -541,7 +625,9 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
       );
     }
 
-    if (_visibleRequests.isEmpty) {
+    // Mostrar mensaje vacío solo si NO hay pendientes Y NO hay pagos pendientes
+    if ((_showFullHistory ? _allRequests : _pendingRequests).isEmpty && 
+        (_showFullHistory || _pendingPaymentRequests.isEmpty)) {
       return RefreshIndicator(
         onRefresh: () => _loadClientRequests(refresh: true),
         child: ListView(
@@ -592,9 +678,195 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
       onRefresh: () => _loadClientRequests(refresh: true),
       child: ListView.builder(
         padding: const EdgeInsets.all(16),
-        itemCount: _visibleRequests.length + 1,
+        itemCount: (_showFullHistory ? _allRequests.length : _pendingRequests.length) + 
+                   (_pendingPaymentRequests.isNotEmpty && !_showFullHistory ? 1 : 0) + 
+                   1, // +1 para el header
         itemBuilder: (context, index) {
-          if (index == 0) {
+          final visibleRequests = _showFullHistory ? _allRequests : _pendingRequests;
+          
+          // Sección de pagos pendientes (solo en vista de pendientes, no en historial)
+          if (_pendingPaymentRequests.isNotEmpty && !_showFullHistory && index == 0) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  margin: const EdgeInsets.only(bottom: 16),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.shade50,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.orange.shade200, width: 2),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.payment, color: Colors.orange.shade700, size: 28),
+                          const SizedBox(width: 12),
+                          const Expanded(
+                            child: Text(
+                              'Pagos Pendientes',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 18,
+                              ),
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.orange.shade700,
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Text(
+                              '${_pendingPaymentRequests.length}',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Tienes servicios finalizados que requieren pago o pagos rechazados que necesitan atención.',
+                        style: TextStyle(color: Colors.black87),
+                      ),
+                      const SizedBox(height: 16),
+                      ..._pendingPaymentRequests.map((item) {
+                        final incidentId = item['incidente_id'] as int?;
+                        final payment = incidentId != null ? _paymentsByIncident[incidentId] : null;
+                        final paymentStatus = payment != null 
+                            ? (payment['status'] ?? '').toString().trim().toLowerCase()
+                            : 'sin_pago';
+                        
+                        String statusText;
+                        Color statusColor;
+                        IconData statusIcon;
+                        bool showButton = true; // Controlar si se muestra el botón
+                        
+                        if (paymentStatus == 'rechazado') {
+                          statusText = 'Pago Rechazado - Reenviar comprobante';
+                          statusColor = Colors.red;
+                          statusIcon = Icons.cancel;
+                        } else if (paymentStatus == 'verificacion') {
+                          statusText = 'En Verificación - Esperando confirmación del taller';
+                          statusColor = Colors.blue;
+                          statusIcon = Icons.hourglass_empty;
+                          showButton = false; // Ocultar botón cuando está en verificación
+                        } else if (paymentStatus == 'pendiente') {
+                          statusText = 'Pendiente - Subir comprobante';
+                          statusColor = Colors.orange;
+                          statusIcon = Icons.upload_file;
+                        } else {
+                          statusText = 'Crear Pago';
+                          statusColor = Colors.green;
+                          statusIcon = Icons.add_card;
+                        }
+                        
+                        final metrica = item['metrica'] is Map
+                            ? Map<String, dynamic>.from(item['metrica'] as Map)
+                            : null;
+                        final costoTotal = metrica != null
+                            ? (metrica['costo_total'] as num?)?.toDouble()
+                            : null;
+                        
+                        return Card(
+                          elevation: 3,
+                          margin: const EdgeInsets.only(bottom: 12),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            side: BorderSide(color: statusColor.withValues(alpha: 0.3), width: 2),
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Icon(statusIcon, color: statusColor, size: 24),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        'Incidente #${item['incidente_id']} - ${item['tipo_problema'] ?? 'Sin tipo'}',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 15,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    color: statusColor.withValues(alpha: 0.15),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    statusText,
+                                    style: TextStyle(
+                                      color: statusColor,
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                ),
+                                if (costoTotal != null) ...[
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    'Monto: Bs. ${costoTotal.toStringAsFixed(2)}',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                ],
+                                const SizedBox(height: 12),
+                                if (showButton)
+                                  SizedBox(
+                                    width: double.infinity,
+                                    child: ElevatedButton.icon(
+                                      onPressed: incidentId != null
+                                          ? () => _openPaymentScreen(incidentId, suggestedAmount: costoTotal)
+                                          : null,
+                                      icon: Icon(
+                                        paymentStatus == 'rechazado' ? Icons.refresh : Icons.payment,
+                                      ),
+                                      label: Text(
+                                        paymentStatus == 'rechazado' 
+                                            ? 'Reenviar Comprobante'
+                                            : paymentStatus == 'pendiente'
+                                                ? 'Subir Comprobante'
+                                                : 'Realizar Pago',
+                                      ),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: statusColor,
+                                        foregroundColor: Colors.white,
+                                        padding: const EdgeInsets.symmetric(vertical: 12),
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          }
+          
+          // Ajustar el índice si hay sección de pagos pendientes
+          final adjustedIndex = (_pendingPaymentRequests.isNotEmpty && !_showFullHistory) ? index - 1 : index;
+          
+          if (adjustedIndex == 0) {
             return Padding(
               padding: const EdgeInsets.only(bottom: 12.0),
               child: Row(
@@ -607,8 +879,8 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
                   Expanded(
                     child: Text(
                       _showFullHistory
-                          ? 'Historial de solicitudes: ${_visibleRequests.length}'
-                          : 'Solicitudes pendientes: ${_visibleRequests.length}',
+                          ? 'Historial de solicitudes: ${visibleRequests.length}'
+                          : 'Solicitudes pendientes: ${visibleRequests.length}',
                       style: const TextStyle(
                         fontWeight: FontWeight.bold,
                         fontSize: 16,
@@ -636,7 +908,12 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
             );
           }
 
-          final item = _visibleRequests[index - 1];
+          // Si no hay solicitudes visibles, no mostrar más items
+          if (adjustedIndex > visibleRequests.length) {
+            return const SizedBox.shrink();
+          }
+
+          final item = visibleRequests[adjustedIndex - 1];
           final estadoSolicitud = (item['estado_solicitud'] ?? '').toString();
           final estadoIncidente = (item['estado_incidente'] ?? '').toString();
           final metrica = item['metrica'] is Map
@@ -648,6 +925,16 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
           final estadoIncidenteDisplay = metrica != null
               ? 'atendido'
               : estadoIncidente;
+
+          // Determinar si el incidente está activo (puede tener seguimiento)
+          final estadoSolicitudLower = estadoSolicitud.toLowerCase();
+          final estadoIncidenteLower = estadoIncidente.toLowerCase();
+          final isActiveIncident = !['rechazada', 'rechazada_tecnico', 'otro_taller_acepto', 'finalizada', 'cancelada'].contains(estadoSolicitudLower) &&
+                                   !['atendido', 'cancelado'].contains(estadoIncidenteLower) &&
+                                   metrica == null;
+          
+          // Determinar si la solicitud fue aceptada (para mostrar taller y seguimiento)
+          final isAccepted = ['aceptada', 'en_proceso', 'en_camino'].contains(estadoSolicitudLower);
 
           return Card(
             elevation: 2,
@@ -685,7 +972,18 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
                     ],
                   ),
                   const SizedBox(height: 8),
-                  Text('Taller: ${item['nombre_taller'] ?? 'Sin asignar'}'),
+                  // Solo mostrar taller si la solicitud fue aceptada o si ya tiene métricas
+                  if (isAccepted || metrica != null)
+                    Text('Taller: ${item['nombre_taller'] ?? 'Sin asignar'}'),
+                  // Si está enviada/pendiente, mostrar mensaje de espera
+                  if (!isAccepted && metrica == null && ['enviada', 'pendiente'].contains(estadoSolicitudLower))
+                    Text(
+                      'Esperando respuesta de talleres...',
+                      style: TextStyle(
+                        color: Colors.orange.shade700,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
                   Text('Prioridad: ${item['prioridad'] ?? '-'}'),
                   Text(
                     'Fecha: ${_formatDate((item['fecha_asignacion'] ?? '').toString())}',
@@ -713,7 +1011,9 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
                         metrica['observaciones'].toString().trim().isNotEmpty)
                       Text('Observación: ${metrica['observaciones']}'),
                   ],
-                  if (item['tecnico_latitud'] != null &&
+                  // Solo mostrar ubicación del técnico si la solicitud fue aceptada
+                  if (isAccepted &&
+                      item['tecnico_latitud'] != null &&
                       item['tecnico_longitud'] != null) ...[
                     const SizedBox(height: 6),
                     Text(
@@ -730,12 +1030,17 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
                     spacing: 8,
                     runSpacing: 8,
                     children: [
-                      ElevatedButton.icon(
-                        onPressed: () => _openTrackingScreen(item),
-                        icon: const Icon(Icons.route),
-                        label: const Text('Seguimiento en tiempo real'),
-                      ),
-                      if (item['tecnico_latitud'] != null &&
+                      // Solo mostrar seguimiento si el incidente está activo Y fue aceptado
+                      if (isActiveIncident && isAccepted)
+                        ElevatedButton.icon(
+                          onPressed: () => _openTrackingScreen(item),
+                          icon: const Icon(Icons.route),
+                          label: const Text('Seguimiento en tiempo real'),
+                        ),
+                      // Solo mostrar Google Maps si está activo, aceptado y tiene ubicación del técnico
+                      if (isActiveIncident &&
+                          isAccepted &&
+                          item['tecnico_latitud'] != null &&
                           item['tecnico_longitud'] != null)
                         OutlinedButton.icon(
                           onPressed: () => _openTechnicianLocationInMaps(
@@ -745,17 +1050,8 @@ class _ClientRequestsStatusViewState extends State<ClientRequestsStatusView> {
                           icon: const Icon(Icons.map_outlined),
                           label: const Text('Abrir en Google Maps'),
                         ),
-                      if (estadoIncidente == 'atendido')
-                        ElevatedButton.icon(
-                          onPressed: () =>
-                              _openPaymentScreen(item['incidente_id']),
-                          icon: const Icon(Icons.payment),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.green,
-                            foregroundColor: Colors.white,
-                          ),
-                          label: const Text('Realizar Pago'),
-                        ),
+                      // NOTA: El botón "Realizar Pago" se muestra en la sección destacada de "Pagos Pendientes"
+                      // No se muestra aquí para evitar duplicación
                     ],
                   ),
                 ],
